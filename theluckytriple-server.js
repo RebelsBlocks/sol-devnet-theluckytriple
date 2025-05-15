@@ -106,8 +106,7 @@ const createGameLimiter = rateLimit({
     message: "Too many game creation requests, please try again later"
 });
 
-// Middleware
-// Używamy najprostszej konfiguracji CORS, która zezwala na żądania z dowolnych domen
+// Middleware - prosta konfiguracja CORS, identyczna jak w blackjack_server.js
 app.use(cors());
 app.use(express.json());
 app.use(apiLimiter); // Apply general rate limiting to all routes by default
@@ -232,6 +231,9 @@ app.use((err, req, res, next) => {
 
 // Start server
 const PORT = process.env.PORT || 3004;
+console.log(`Starting The Lucky Triple Server on port ${PORT}`);
+console.log(`Solana network: ${SOLANA_NETWORK}`);
+
 app.listen(PORT, () => {
     console.log(`Server is running on port ${PORT}`);
 });

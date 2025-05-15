@@ -1,0 +1,23 @@
+{
+  "name": "the-lucky-triple-server",
+  "version": "1.0.0",
+  "description": "Server for The Lucky Triple game",
+  "main": "theluckytriple-server.js",
+  "scripts": {
+    "start": "node theluckytriple-server.js",
+    "dev": "nodemon theluckytriple-server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.1.5",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "@solana/web3.js": "^1.78.5",
+    "@solana/spl-token": "^0.3.9",
+    "bs58": "^5.0.0",
+    "bn.js": "^5.2.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.3"
+  }
+} 

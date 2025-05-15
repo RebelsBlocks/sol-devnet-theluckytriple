@@ -107,7 +107,14 @@ const createGameLimiter = rateLimit({
 });
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: [
+    'https://solana.warsofcards.online',
+    'http://localhost:3004'
+  ],
+  methods: ['GET', 'POST', 'OPTIONS'],
+  credentials: true
+}));
 app.use(express.json());
 app.use(apiLimiter); // Apply general rate limiting to all routes by default
 

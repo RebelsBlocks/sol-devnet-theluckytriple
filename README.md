@@ -1,4 +1,4 @@
-# Wars of Cards: The Lucky Triple
+# The Lucky Triple
 
 A Solana blockchain-based card game server for The Lucky Triple game.
 

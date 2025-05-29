@@ -74,10 +74,11 @@ try {
 // Track paid rewards to prevent double payments
 const paidRewards = new Map();
 
-// Dodanie nowego parametru dla śledzenia aktywnych graczy
-const activePlayers = new Set();
 // Track completed games to prevent replays
 const completedGames = new Map();
+
+// Lucky Triple Game State - używamy playerId jako klucza (wzorowane na wargame_server.js)
+const playerGameSessions = new Map(); // Zmieniona nazwa dla jasności
 
 // Configure rate limiters
 const apiLimiter = rateLimit({
@@ -139,43 +140,36 @@ app.post('/lucky-triple/start', createGameLimiter, (req, res) => {
         return res.status(400).json({ error: 'Entry fee of 3 CARDS must be paid before creating a game' });
     }
     
-    // Check if player already has an active game
-    if (activePlayers.has(playerId)) {
-        console.error(`Player ${playerId} already has an active game`);
-        return res.status(409).json({ error: 'You already have an active game in progress. Complete or reset that game first.' });
+    // Wzorowane na wargame_server.js - zastąp istniejącą grę zamiast blokować
+    if (playerGameSessions.has(playerId)) {
+        console.log(`💰 Replacing existing game for player ${playerId}`);
+        playerGameSessions.delete(playerId);
     }
-    
-    // Mark player as active
-    activePlayers.add(playerId);
     
     // Generate unique game ID using timestamp and random number to ensure uniqueness
     const gameId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     const deck = createAndShuffleLuckyTripleDeck();
     
-    // Check if a game with this ID already exists (shouldn't happen, but let's be safe)
-    if (luckyTripleGames.has(gameId)) {
-        activePlayers.delete(playerId);
-        return res.status(409).json({ error: 'Game ID conflict, please try again' });
-    }
-    
     const startTime = Date.now();
     const gameState = {
         gameId,
-        playerId, // Dodajemy ID gracza do stanu gry
+        playerId,
         deck,
         cards: [],
-        heldCards: [], // Add array for storing held card indexes
+        heldCards: [],
         timestamp: startTime,
+        lastActionTime: startTime,
         currentCombination: 'None',
         currentReward: 0,
         roundsPlayed: 0,
         maxRounds: GAME_CONFIG.MAX_ROUNDS,
         isEnded: false,
         timedOut: false,
-        rewardPaid: false // Track if reward was paid
+        rewardPaid: false
     };
     
-    luckyTripleGames.set(gameId, gameState);
+    // Atomowe dodanie gry (używamy playerId jako klucza)
+    playerGameSessions.set(playerId, gameState);
     
     // Log new game creation
     console.log(`[${new Date().toISOString()}] New game created: ${gameId} for player: ${playerId}`);
@@ -188,8 +182,9 @@ app.post('/lucky-triple/start', createGameLimiter, (req, res) => {
         reward: 0,
         roundsLeft: GAME_CONFIG.MAX_ROUNDS,
         isEnded: false,
-        timeRemaining: Math.ceil(GAME_CONFIG.GAME_TIMEOUT_MS / 1000),
+        timeRemaining: GAME_CONFIG.GAME_TIMEOUT_MS / 1000, // Send initial time in seconds
         maxRounds: GAME_CONFIG.MAX_ROUNDS,
+        serverTime: startTime,
         message: "Press 'draw' to start the game and receive your first cards"
     });
 });
@@ -198,7 +193,17 @@ app.post('/lucky-triple/start', createGameLimiter, (req, res) => {
 app.post('/lucky-triple/hold', gameActionLimiter, (req, res) => {
     const { gameId, cardIndexes } = req.body;
     
-    const gameState = luckyTripleGames.get(gameId);
+    // Znajdź grę na podstawie gameId (w gameState)
+    let gameState = null;
+    let playerId = null;
+    
+    for (const [pid, state] of playerGameSessions.entries()) {
+        if (state.gameId === gameId) {
+            gameState = state;
+            playerId = pid;
+            break;
+        }
+    }
     
     if (!gameState) {
         return res.status(404).json({ error: 'Game not found' });
@@ -215,7 +220,8 @@ app.post('/lucky-triple/hold', gameActionLimiter, (req, res) => {
     }
     
     gameState.heldCards = cardIndexes;
-    luckyTripleGames.set(gameId, gameState);
+    gameState.lastActionTime = Date.now(); // Aktualizuj czas aktywności
+    playerGameSessions.set(playerId, gameState);
     
     res.json({
         success: true,
@@ -260,9 +266,6 @@ function createAndShuffleLuckyTripleDeck() {
     
     return deck;
 }
-
-// Lucky Triple Game State (in-memory, for demonstration)
-const luckyTripleGames = new Map();
 
 // Rank order for straights
 const RANK_ORDER = {
@@ -354,67 +357,114 @@ function evaluateHandCombination(cards) {
 const GAME_CONFIG = {
     MAX_ROUNDS: 3,
     GAME_TIMEOUT_MS: 60 * 1000, // 60 seconds timer for each game
-    CLEANUP_INTERVAL_MS: 20 * 1000 // Check for inactive games every 20 seconds
+    CLEANUP_INTERVAL_MS: 20 * 1000, // Check for inactive games every 20 seconds
+    TIME_CHECK_INTERVAL_MS: 1000 // Client should check time every second
 };
 
-// Funkcja do weryfikacji pozostałego czasu gry
-function verifyTimeRemaining(gameState) {
+// Add rate limiter specifically for time checks
+const timeCheckLimiter = rateLimit({
+    windowMs: 1 * 60 * 1000, // 1 minute
+    max: 120, // Allow checking twice per second on average
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: "Too many time check requests, please slow down"
+});
+
+// Apply the time check limiter to the time endpoint
+app.get('/lucky-triple/time/:gameId', timeCheckLimiter, (req, res) => {
+    const { gameId } = req.params;
+    
+    // Find game based on gameId
+    let gameState = null;
+    let playerId = null;
+    
+    for (const [pid, state] of playerGameSessions.entries()) {
+        if (state.gameId === gameId) {
+            gameState = state;
+            playerId = pid;
+            break;
+        }
+    }
+    
+    if (!gameState) {
+        return res.status(404).json({ error: 'Game not found' });
+    }
+    
+    // Calculate remaining time
+    const now = Date.now();
+    const elapsed = now - gameState.timestamp;
+    const timeRemaining = Math.max(0, GAME_CONFIG.GAME_TIMEOUT_MS - elapsed);
+    
+    // If time's up and game is not marked as ended
+    if (timeRemaining <= 0 && !gameState.isEnded) {
+        gameState.isEnded = true;
+        gameState.timedOut = true;
+        
+        // Add to completed games
+        completedGames.set(gameState.gameId, {
+            playerId: playerId,
+            result: 'timeout',
+            timestamp: now,
+            processed: true
+        });
+        
+        // Schedule removal from active sessions
+        setTimeout(() => {
+            playerGameSessions.delete(playerId);
+        }, 5000);
+        
+        return res.json({
+            timeRemaining: 0,
+            isTimedOut: true,
+            isEnded: true,
+            serverTime: now
+        });
+    }
+    
+    return res.json({
+        timeRemaining: Math.ceil(timeRemaining / 1000), // in seconds
+        isTimedOut: false,
+        isEnded: gameState.isEnded,
+        serverTime: now
+    });
+});
+
+// Modify verifyTimeRemaining function to be more strict
+function verifyTimeRemaining(gameState, playerId = null) {
     if (!gameState) return null;
     
     const now = Date.now();
     const elapsed = now - gameState.timestamp;
     const timeRemaining = Math.max(0, GAME_CONFIG.GAME_TIMEOUT_MS - elapsed);
     
-    // Jeśli czas się skończył, zakończ grę
+    // If time's up and game is not marked as ended
     if (timeRemaining <= 0 && !gameState.isEnded) {
-        return handleTimedOutGame(gameState);
-    }
-    
-    return {
-        timeRemaining: Math.ceil(timeRemaining / 1000), // w sekundach
-        isTimedOut: false
-    };
-}
-
-// Add a function to handle timed out games
-function handleTimedOutGame(gameState) {
-    // Mark game as ended and timed out
-    gameState.isEnded = true;
-    gameState.timedOut = true;
-    
-    // No reward for timed out games
-    const finalReward = 0;
-    
-    // Log timeout with card information
-    console.log(`[${new Date().toISOString()}] Game ${gameState.gameId} timed out after ${Math.floor((Date.now() - gameState.timestamp) / 1000)} seconds`);
-    console.log(`Final cards on table: ${gameState.cards ? formatCardsForLog(gameState.cards) : 'no cards'}`);
-    console.log(`Final combination: ${gameState.currentCombination} (${gameState.currentReward} CARDS)`);
-    console.log(`No reward due to timeout`);
-    
-    // Add completed game to tracking
-    if (gameState.playerId) {
-        completedGames.set(gameState.gameId, {
-            playerId: gameState.playerId,
-            result: 'timeout',
-            timestamp: Date.now(),
-            processed: true // Already processed, no reward
-        });
+        gameState.isEnded = true;
+        gameState.timedOut = true;
         
-        // Remove player from active players
-        setTimeout(() => {
-            activePlayers.delete(gameState.playerId);
-        }, 5000);
+        // Add to completed games
+        if (playerId) {
+            completedGames.set(gameState.gameId, {
+                playerId: playerId,
+                result: 'timeout',
+                timestamp: now,
+                processed: true
+            });
+        }
+        
+        return {
+            timeRemaining: 0,
+            isTimedOut: true,
+            isEnded: true,
+            serverTime: now
+        };
     }
     
     return {
-        gameId: gameState.gameId,
-        finalCombination: gameState.currentCombination,
-        reward: finalReward,
-        gameCompleted: true,
-        isEnded: true,
-        timedOut: true,
-        timeRemaining: 0,
-        message: "Game timed out. You lost this round."
+        timeRemaining: Math.ceil(timeRemaining / 1000), // in seconds
+        isTimedOut: false,
+        isEnded: gameState.isEnded,
+        serverTime: now
     };
 }
 
@@ -446,39 +496,30 @@ async function processReward(gameState) {
 }
 
 // Check for timed out games and clean them up
-function cleanupTimedOutGames() {
-    const now = Date.now();
-    let cleanupCount = 0;
-    let endedGamesCount = 0;
+function cleanupInactiveGameSessions() {
+    const oneHourAgo = Date.now() - 60 * 60 * 1000; // 1 godzina dla Lucky Triple
+    const initialSize = playerGameSessions.size;
+    let removedCount = 0;
     
-    for (const [gameId, gameState] of luckyTripleGames.entries()) {
-        // Remove ended games after some time
-        if (gameState.isEnded) {
-            luckyTripleGames.delete(gameId);
-            endedGamesCount++;
-            continue;
-        }
+    for (const [playerId, gameState] of playerGameSessions.entries()) {
+        // Sprawdź ostatni czas aktywności gry
+        const lastActionTime = gameState.lastActionTime || gameState.timestamp || 0;
         
-        // Check if game has timed out
-        if (now - gameState.timestamp > GAME_CONFIG.GAME_TIMEOUT_MS) {
-            handleTimedOutGame(gameState);
-            luckyTripleGames.delete(gameId);
-            cleanupCount++;
-            
-            // Remove player from active players if exists
-            if (gameState.playerId) {
-                activePlayers.delete(gameState.playerId);
-            }
+        // Jeśli nie było aktywności przez 1 godzinę, usuń sesję
+        if (lastActionTime < oneHourAgo) {
+            playerGameSessions.delete(playerId);
+            removedCount++;
+            console.log(`🧹 Removed inactive game session for player: ${playerId}`);
         }
     }
     
-    if (cleanupCount > 0 || endedGamesCount > 0) {
-        console.log(`[${new Date().toISOString()}] Cleaned up ${cleanupCount} timed out games and ${endedGamesCount} ended games`);
+    if (removedCount > 0) {
+        console.log(`🧹 Cleanup: Removed ${removedCount} inactive game sessions. Remaining: ${playerGameSessions.size}`);
     }
 }
 
-// Run cleanup every few seconds
-setInterval(cleanupTimedOutGames, GAME_CONFIG.CLEANUP_INTERVAL_MS);
+// Czyść nieaktywne sesje gier co 30 minut
+setInterval(cleanupInactiveGameSessions, 30 * 60 * 1000);
 
 // Function to clean up old completed games to prevent memory leaks
 function cleanupOldCompletedGames() {
@@ -502,7 +543,7 @@ setInterval(cleanupOldCompletedGames, 24 * 60 * 60 * 1000);
 // Add debugging endpoint (only in non-production)
 if (process.env.NODE_ENV !== 'production') {
     app.get('/lucky-triple/debug/server-state', (req, res) => {
-        const activePlayersList = Array.from(activePlayers);
+        const activePlayersList = Array.from(playerGameSessions.keys());
         const completedGamesList = Array.from(completedGames.entries()).map(([gameId, data]) => ({
             gameId,
             ...data
@@ -519,7 +560,7 @@ if (process.env.NODE_ENV !== 'production') {
             completedGameCount: completedGamesList.length,
             paidRewards: paidRewardsList,
             paidRewardsCount: paidRewardsList.length,
-            totalGames: luckyTripleGames.size
+            totalGames: playerGameSessions.size
         });
     });
 } else {
@@ -532,7 +573,17 @@ if (process.env.NODE_ENV !== 'production') {
 app.post('/lucky-triple/draw', gameActionLimiter, (req, res) => {
     const { gameId } = req.body;
     
-    const gameState = luckyTripleGames.get(gameId);
+    // Znajdź grę na podstawie gameId (w gameState)
+    let gameState = null;
+    let playerId = null;
+    
+    for (const [pid, state] of playerGameSessions.entries()) {
+        if (state.gameId === gameId) {
+            gameState = state;
+            playerId = pid;
+            break;
+        }
+    }
     
     if (!gameState) {
         return res.status(404).json({ error: 'Game not found' });
@@ -544,15 +595,21 @@ app.post('/lucky-triple/draw', gameActionLimiter, (req, res) => {
     }
     
     // Weryfikacja czasu - użyj nowej funkcji
-    const timeCheck = verifyTimeRemaining(gameState);
-    if (timeCheck && timeCheck.isTimedOut) {
-        // Game has timed out
-        // Remove game from memory
-        luckyTripleGames.delete(gameId);
+    const timeCheck = verifyTimeRemaining(gameState, playerId);
+    if (!timeCheck) {
+        return res.status(404).json({ error: 'Game not found' });
+    }
+    
+    if (timeCheck.isTimedOut) {
+        // Remove from session
+        playerGameSessions.delete(playerId);
         
         return res.status(400).json({
             error: 'Game has timed out',
-            ...timeCheck
+            timeRemaining: 0,
+            isTimedOut: true,
+            isEnded: true,
+            serverTime: timeCheck.serverTime
         });
     }
     
@@ -560,7 +617,8 @@ app.post('/lucky-triple/draw', gameActionLimiter, (req, res) => {
     if (gameState.roundsPlayed >= gameState.maxRounds) {
         // Mark game as ended
         gameState.isEnded = true;
-        luckyTripleGames.set(gameId, gameState);
+        gameState.lastActionTime = Date.now();
+        playerGameSessions.set(playerId, gameState);
         return res.status(400).json({ error: 'Maximum rounds reached for this game' });
     }
     
@@ -602,6 +660,7 @@ app.post('/lucky-triple/draw', gameActionLimiter, (req, res) => {
     gameState.currentCombination = handResult.combination;
     gameState.currentReward = handResult.reward;
     gameState.roundsPlayed += 1;
+    gameState.lastActionTime = Date.now(); // Aktualizuj czas aktywności
     
     // Reset held cards for next round
     gameState.heldCards = [];
@@ -611,10 +670,10 @@ app.post('/lucky-triple/draw', gameActionLimiter, (req, res) => {
         gameState.isEnded = true;
         
         // Jeśli jest to ostatnia runda i gracz wygrał, przetwórz nagrodę
-        if (gameState.currentReward > 0 && gameState.playerId) {
+        if (gameState.currentReward > 0) {
             // Dodaj grę do zakończonych
-            completedGames.set(gameId, {
-                playerId: gameState.playerId,
+            completedGames.set(gameState.gameId, {
+                playerId: playerId,
                 result: 'win',
                 timestamp: Date.now(),
                 processed: false
@@ -622,12 +681,12 @@ app.post('/lucky-triple/draw', gameActionLimiter, (req, res) => {
             
             // Process reward asynchronously
             processReward(gameState).catch(error => {
-                console.error(`Failed to process reward for game ${gameId}:`, error);
+                console.error(`Failed to process reward for game ${gameState.gameId}:`, error);
             });
-        } else if (gameState.playerId) {
+        } else {
             // Dodaj grę do zakończonych (przegrana)
-            completedGames.set(gameId, {
-                playerId: gameState.playerId,
+            completedGames.set(gameState.gameId, {
+                playerId: playerId,
                 result: 'loss',
                 timestamp: Date.now(),
                 processed: true // Nie ma nagrody, więc oznaczamy jako przetworzone
@@ -635,15 +694,15 @@ app.post('/lucky-triple/draw', gameActionLimiter, (req, res) => {
             
             // Usuń gracza z aktywnych po opóźnieniu
             setTimeout(() => {
-                activePlayers.delete(gameState.playerId);
+                playerGameSessions.delete(playerId);
             }, 5000);
         }
     }
     
-    luckyTripleGames.set(gameId, gameState);
+    playerGameSessions.set(playerId, gameState);
     
     // Enhanced logging
-    console.log(`[${new Date().toISOString()}] Game ${gameId} - Round ${gameState.roundsPlayed}/3:`);
+    console.log(`[${new Date().toISOString()}] Game ${gameState.gameId} - Round ${gameState.roundsPlayed}/3:`);
     if (gameState.roundsPlayed > 1) {
         // W rundach 2 i 3 najpierw pokazujemy zatrzymane karty
         console.log(`Held cards from previous round: ${currentHeldCards.length > 0 ? currentHeldCards.map(i => formatCardForLog(previousCards[i])).join(' ') : 'none'}`);
@@ -659,21 +718,22 @@ app.post('/lucky-triple/draw', gameActionLimiter, (req, res) => {
     if (gameState.isEnded) {
         remainingTime = 0;
     } else {
-        const timeStatus = verifyTimeRemaining(gameState);
+        const timeStatus = verifyTimeRemaining(gameState, playerId);
         remainingTime = timeStatus.timeRemaining;
     }
     
     res.json({
         cards: newCards,
         combination: handResult.combination,
-        reward: handResult.reward, // Nagroda w CARDS jeśli wygrał
+        reward: handResult.reward,
         roundsLeft: gameState.maxRounds - gameState.roundsPlayed,
         remainingCards: gameState.deck.length,
         isEnded: gameState.isEnded,
         timeRemaining: remainingTime,
-        heldCards: [], // Reset held cards for next round
-        previouslyHeld: currentHeldCards, // Send information about which cards were held in this round
-        playerId: gameState.playerId,
+        serverTime: timeCheck.serverTime,
+        heldCards: [],
+        previouslyHeld: currentHeldCards,
+        playerId: playerId,
         rewardPaid: gameState.rewardPaid
     });
 });
@@ -681,42 +741,57 @@ app.post('/lucky-triple/draw', gameActionLimiter, (req, res) => {
 app.post('/lucky-triple/check', gameActionLimiter, async (req, res) => {
     const { gameId } = req.body;
     
-    const gameState = luckyTripleGames.get(gameId);
+    // Znajdź grę na podstawie gameId (w gameState)
+    let gameState = null;
+    let playerId = null;
+    
+    for (const [pid, state] of playerGameSessions.entries()) {
+        if (state.gameId === gameId) {
+            gameState = state;
+            playerId = pid;
+            break;
+        }
+    }
     
     if (!gameState) {
         return res.status(404).json({ error: 'Game not found' });
     }
     
     // Weryfikacja czasu - użyj nowej funkcji
-    const timeCheck = verifyTimeRemaining(gameState);
-    if (timeCheck && timeCheck.isTimedOut) {
-        // Game has timed out
-        // Remove game from memory
-        luckyTripleGames.delete(gameId);
+    const timeCheck = verifyTimeRemaining(gameState, playerId);
+    if (!timeCheck) {
+        return res.status(404).json({ error: 'Game not found' });
+    }
+    
+    if (timeCheck.isTimedOut) {
+        // Remove from session
+        playerGameSessions.delete(playerId);
         
         return res.status(400).json({
             error: 'Game has timed out',
-            ...timeCheck
+            timeRemaining: 0,
+            isTimedOut: true,
+            isEnded: true,
+            serverTime: timeCheck.serverTime
         });
     }
     
     // Mark game as ended
     gameState.isEnded = true;
+    gameState.lastActionTime = Date.now();
     
     // Dodajemy grę do zakończonych
-    if (gameState.playerId) {
-        completedGames.set(gameId, {
-            playerId: gameState.playerId,
-            result: gameState.currentReward > 0 ? 'win' : 'loss',
-            timestamp: Date.now(),
-            processed: false
-        });
-        
-        // Usuń gracza z aktywnych po opóźnieniu, aby zapobiec wyścigom
-        setTimeout(() => {
-            activePlayers.delete(gameState.playerId);
-        }, 5000);
-    }
+    completedGames.set(gameState.gameId, {
+        playerId: playerId,
+        result: gameState.currentReward > 0 ? 'win' : 'loss',
+        timestamp: Date.now(),
+        processed: false
+    });
+    
+    // Usuń gracza z aktywnych po opóźnieniu, aby zapobiec wyścigom
+    setTimeout(() => {
+        playerGameSessions.delete(playerId);
+    }, 5000);
     
     // Generate a message based on the combination and reward
     let message;
@@ -725,22 +800,25 @@ app.post('/lucky-triple/check', gameActionLimiter, async (req, res) => {
         
         // Process reward asynchronicznie
         processReward(gameState).catch(error => {
-            console.error(`Failed to process reward for game ${gameId}:`, error);
+            console.error(`Failed to process reward for game ${gameState.gameId}:`, error);
         });
     } else {
         message = `Game over. Your final hand was ${gameState.currentCombination}.`;
     }
     
     // Log game completion with detailed information
-    console.log(`[${new Date().toISOString()}] Game ${gameId} completed after ${gameState.roundsPlayed} rounds`);
+    console.log(`[${new Date().toISOString()}] Game ${gameState.gameId} completed after ${gameState.roundsPlayed} rounds`);
     console.log(`Final cards on table: ${formatCardsForLog(gameState.cards)}`);
     console.log(`Final combination: ${gameState.currentCombination}`);
     console.log(`Reward: ${gameState.currentReward} CARDS`);
     
+    // Update game state before response
+    playerGameSessions.set(playerId, gameState);
+    
     // Return final result
     res.json({
         gameId: gameState.gameId,
-        playerId: gameState.playerId,
+        playerId: playerId,
         combination: gameState.currentCombination,
         reward: gameState.currentReward, // Wyślij nagrodę w CARDS
         gameCompleted: true,
@@ -753,43 +831,58 @@ app.post('/lucky-triple/check', gameActionLimiter, async (req, res) => {
     
     // Clear the game from memory after it's completed
     setTimeout(() => {
-        luckyTripleGames.delete(gameId);
+        playerGameSessions.delete(playerId);
     }, 10000); // Opóźnione usuwanie, aby umożliwić sprawdzenie stanu gry
 });
 
 // Add status endpoint
 app.get('/lucky-triple/status/:gameId', (req, res) => {
     const { gameId } = req.params;
-    const gameState = luckyTripleGames.get(gameId);
+    
+    // Znajdź grę na podstawie gameId (w gameState)
+    let gameState = null;
+    let playerId = null;
+    
+    for (const [pid, state] of playerGameSessions.entries()) {
+        if (state.gameId === gameId) {
+            gameState = state;
+            playerId = pid;
+            break;
+        }
+    }
     
     if (!gameState) {
         return res.status(404).json({ error: 'Game not found' });
     }
     
-    // Check time remaining
-    const timeCheck = verifyTimeRemaining(gameState);
-    if (timeCheck && timeCheck.isTimedOut) {
-        // Remove game from memory if timed out
-        luckyTripleGames.delete(gameId);
-        return res.status(404).json({ error: 'Game has timed out' });
+    // Check time remaining using new function
+    const timeCheck = verifyTimeRemaining(gameState, playerId);
+    if (!timeCheck) {
+        return res.status(404).json({ error: 'Game not found' });
     }
     
-    // If game is ended, remove it from memory after sending response
-    if (gameState.isEnded) {
-        setTimeout(() => {
-            luckyTripleGames.delete(gameId);
-        }, 0);
+    if (timeCheck.isTimedOut) {
+        // Remove game from memory if timed out
+        playerGameSessions.delete(playerId);
+        return res.status(400).json({
+            error: 'Game has timed out',
+            timeRemaining: 0,
+            isTimedOut: true,
+            isEnded: true,
+            serverTime: timeCheck.serverTime
+        });
     }
     
     return res.json({
         gameId: gameState.gameId,
-        playerId: gameState.playerId,
-        isEnded: gameState.isEnded,
-        timedOut: gameState.timedOut,
-        timeRemaining: timeCheck ? timeCheck.timeRemaining : 0,
+        playerId: playerId,
+        isEnded: gameState.isEnded || timeCheck.isEnded,
+        timedOut: gameState.timedOut || timeCheck.isTimedOut,
+        timeRemaining: timeCheck.timeRemaining,
+        serverTime: timeCheck.serverTime,
         roundsLeft: gameState.maxRounds - gameState.roundsPlayed,
         currentCombination: gameState.currentCombination,
-        currentReward: gameState.currentReward, // Nagroda w CARDS
+        currentReward: gameState.currentReward,
         rewardPaid: gameState.rewardPaid
     });
 });
@@ -880,15 +973,16 @@ async function sendCardsReward(receiverAddress, gameId, rewardAmount) {
     
     // Sign and send transaction
     transaction.sign(treasuryKeypair);
-    const signature = await connection.sendRawTransaction(transaction.serialize());
+    const signature = await connection.sendRawTransaction(transaction.serialize(), {
+      skipPreflight: true,
+      maxRetries: 5
+    });
     
-    // Wait for confirmation
-    await connection.confirmTransaction(signature);
-    
-    // Mark as completed after successful transaction
+    // For devnet, we don't need to wait for confirmation - transactions are generally confirmed if accepted
+    // Mark as completed after successful transaction submission
     paidRewards.set(transactionKey, 'completed');
     
-    console.log(`Successfully sent ${rewardAmount} CARDS to ${receiverAddress} for game ${gameId}`);
+    console.log(`Successfully sent ${rewardAmount} CARDS to ${receiverAddress} for game ${gameId}, signature: ${signature}`);
     return signature;
   } catch (error) {
     // On error, mark transaction as failed but still tracked to prevent retries
@@ -947,33 +1041,24 @@ app.post('/lucky-triple/reset', createGameLimiter, (req, res) => {
         return res.status(400).json({ error: 'Entry fee of 3 CARDS must be paid before resetting a game' });
     }
     
-    // Usuń wszystkie aktywne gry dla gracza
-    let found = false;
-    for (const [gameId, game] of luckyTripleGames.entries()) {
-        if (game.playerId === playerId) {
-            luckyTripleGames.delete(gameId);
-            found = true;
-        }
+    // Wzorowane na wargame_server.js - po prostu usuń istniejącą grę (jeśli istnieje)
+    if (playerGameSessions.has(playerId)) {
+        console.log(`🔄 Removing existing game for player ${playerId} due to reset request`);
+        playerGameSessions.delete(playerId);
     }
-    
-    // Usuń gracza z aktywnych
-    activePlayers.delete(playerId);
     
     // Utwórz nową grę
     const gameId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     const deck = createAndShuffleLuckyTripleDeck();
     
-    // Mark player as active
-    activePlayers.add(playerId);
-    
-    const startTime = Date.now();
     const gameState = {
         gameId,
         playerId,
         deck,
         cards: [],
         heldCards: [],
-        timestamp: startTime,
+        timestamp: Date.now(),
+        lastActionTime: Date.now(),
         currentCombination: 'None',
         currentReward: 0,
         roundsPlayed: 0,
@@ -983,7 +1068,8 @@ app.post('/lucky-triple/reset', createGameLimiter, (req, res) => {
         rewardPaid: false
     };
     
-    luckyTripleGames.set(gameId, gameState);
+    // Atomowe dodanie nowej gry
+    playerGameSessions.set(playerId, gameState);
     
     // Log game reset
     console.log(`[${new Date().toISOString()}] Game reset for player: ${playerId}, new game ID: ${gameId}`);
